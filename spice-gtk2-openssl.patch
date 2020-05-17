@@ -1,0 +1,472 @@
+Support for OpenSSL 1.1.x frm spice-gtk-0.38
+--- spice-gtk-0.31/src/bio-gio.c.orig	2015-11-11 22:28:40.000000000 +0100
++++ spice-gtk-0.31/src/bio-gio.c	2020-05-16 22:07:27.066819305 +0200
+@@ -23,21 +23,92 @@
+ #include "spice-util.h"
+ #include "bio-gio.h"
+ 
+-typedef struct bio_gsocket_method {
+-    BIO_METHOD method;
+-    GIOStream *stream;
+-} bio_gsocket_method;
+-
+-#define BIO_GET_GSOCKET(bio)  (((bio_gsocket_method*)bio->method)->gsocket)
+-#define BIO_GET_ISTREAM(bio)  (g_io_stream_get_input_stream(((bio_gsocket_method*)bio->method)->stream))
+-#define BIO_GET_OSTREAM(bio)  (g_io_stream_get_output_stream(((bio_gsocket_method*)bio->method)->stream))
++#if OPENSSL_VERSION_NUMBER < 0x10100000 || \
++    (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x20700000)
++static BIO_METHOD one_static_bio;
++
++static int BIO_meth_set_read(BIO_METHOD *biom,
++                             int (*bread) (BIO *, char *, int))
++{
++    biom->bread = bread;
++    return 1;
++}
++
++static int BIO_meth_set_write(BIO_METHOD *biom,
++                              int (*bwrite) (BIO *, const char *, int))
++{
++    biom->bwrite = bwrite;
++    return 1;
++}
++
++static int BIO_meth_set_puts(BIO_METHOD *biom,
++                             int (*bputs) (BIO *, const char *))
++{
++    biom->bputs = bputs;
++    return 1;
++}
++
++static int BIO_meth_set_ctrl(BIO_METHOD *biom,
++                             long (*ctrl) (BIO *, int, long, void *))
++{
++    biom->ctrl = ctrl;
++    return 1;
++}
++
++#define BIO_TYPE_START 128
++
++static int BIO_get_new_index(void)
++{
++    static int bio_index = BIO_TYPE_START;
++    return bio_index++;
++}
++
++static void BIO_set_init(BIO *a, int init)
++{
++	a->init = init;
++}
++
++static void BIO_set_data(BIO *a, void *ptr)
++{
++    a->ptr = ptr;
++}
++
++static void *BIO_get_data(BIO *a)
++{
++    return a->ptr;
++}
++
++static BIO_METHOD *BIO_meth_new(int type, const char *name)
++{
++    BIO_METHOD *biom = &one_static_bio;
++
++    biom->type = type;
++    biom->name = name;
++    return biom;
++}
++
++static void BIO_meth_free(BIO_METHOD *biom)
++{
++}
++
++#endif
++
++static long bio_gio_ctrl(G_GNUC_UNUSED BIO *b,
++                         int cmd,
++                         G_GNUC_UNUSED long num,
++                         G_GNUC_UNUSED void *ptr)
++{
++    return (cmd == BIO_CTRL_FLUSH);
++}
+ 
+ static int bio_gio_write(BIO *bio, const char *in, int inl)
+ {
++    GOutputStream *stream;
+     gssize ret;
+     GError *error = NULL;
+ 
+-    ret = g_pollable_output_stream_write_nonblocking(G_POLLABLE_OUTPUT_STREAM(BIO_GET_OSTREAM(bio)),
++    stream = g_io_stream_get_output_stream(BIO_get_data(bio));
++    ret = g_pollable_output_stream_write_nonblocking(G_POLLABLE_OUTPUT_STREAM(stream),
+                                                      in, inl, NULL, &error);
+     BIO_clear_retry_flags(bio);
+ 
+@@ -53,10 +124,12 @@
+ 
+ static int bio_gio_read(BIO *bio, char *out, int outl)
+ {
++    GInputStream *stream;
+     gssize ret;
+     GError *error = NULL;
+ 
+-    ret = g_pollable_input_stream_read_nonblocking(G_POLLABLE_INPUT_STREAM(BIO_GET_ISTREAM(bio)),
++    stream = g_io_stream_get_input_stream(BIO_get_data(bio));
++    ret = g_pollable_input_stream_read_nonblocking(G_POLLABLE_INPUT_STREAM(stream),
+                                                    out, outl, NULL, &error);
+     BIO_clear_retry_flags(bio);
+ 
+@@ -70,18 +143,6 @@
+     return ret;
+ }
+ 
+-static int bio_gio_destroy(BIO *bio)
+-{
+-    if (bio == NULL || bio->method == NULL)
+-        return 0;
+-
+-    SPICE_DEBUG("bio gsocket destroy");
+-    g_free(bio->method);
+-    bio->method = NULL;;
+-
+-    return 1;
+-}
+-
+ static int bio_gio_puts(BIO *bio, const char *str)
+ {
+     int n, ret;
+@@ -92,23 +153,35 @@
+     return ret;
+ }
+ 
++static BIO_METHOD *bio_gio_method;
++
+ G_GNUC_INTERNAL
+ BIO* bio_new_giostream(GIOStream *stream)
+ {
+-    // TODO: make an actual new BIO type, or just switch to GTls already...
+-    BIO *bio = BIO_new_socket(-1, BIO_NOCLOSE);
++    BIO *bio;
++
++    if (!bio_gio_method) {
++        bio_gio_method = BIO_meth_new(BIO_get_new_index() |
++                                      BIO_TYPE_SOURCE_SINK,
++                                      "gio stream");
++        if (!bio_gio_method)
++            return NULL;
++
++        if (!BIO_meth_set_write(bio_gio_method, bio_gio_write) ||
++            !BIO_meth_set_read(bio_gio_method, bio_gio_read) ||
++            !BIO_meth_set_puts(bio_gio_method, bio_gio_puts) ||
++            !BIO_meth_set_ctrl(bio_gio_method, bio_gio_ctrl)) {
++            BIO_meth_free(bio_gio_method);
++            bio_gio_method = NULL;
++            return NULL;
++        }
++    }
+ 
+-    bio_gsocket_method *bio_method = g_new(bio_gsocket_method, 1);
+-    bio_method->method = *bio->method;
+-    bio_method->stream = stream;
+-
+-    bio->method->destroy(bio);
+-    bio->method = (BIO_METHOD*)bio_method;
+-
+-    bio->method->bwrite = bio_gio_write;
+-    bio->method->bread = bio_gio_read;
+-    bio->method->bputs = bio_gio_puts;
+-    bio->method->destroy = bio_gio_destroy;
++    bio = BIO_new(bio_gio_method);
++    if (!bio)
++        return NULL;
+ 
++    BIO_set_init(bio, 1);
++    BIO_set_data(bio, stream);
+     return bio;
+ }
+--- spice-gtk-0.31/src/spice-channel.c.orig	2016-03-11 19:04:46.000000000 +0100
++++ spice-gtk-0.31/src/spice-channel.c	2020-05-16 22:18:16.793299435 +0200
+@@ -56,6 +56,16 @@
+ static void spice_channel_send_migration_handshake(SpiceChannel *channel);
+ static gboolean channel_connect(SpiceChannel *channel, gboolean tls);
+ 
++#if OPENSSL_VERSION_NUMBER < 0x10100000 || \
++    (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x20700000)
++static RSA *EVP_PKEY_get0_RSA(EVP_PKEY *pkey)
++{
++    if (pkey->type != EVP_PKEY_RSA) {
++        return NULL;
++    }
++    return pkey->pkey.rsa;
++}
++#endif
+ /**
+  * SECTION:spice-channel
+  * @short_description: the base channel class
+@@ -739,6 +749,53 @@
+ }
+ 
+ /*
++ * Helper function to deal with the nonblocking part of _flush_wire() function.
++ * It returns the result of the write and will set the proper bits in @cond in
++ * case the write function would block.
++ *
++ * Returns -1 in case of any problems.
++ */
++/* coroutine context */
++static gint spice_channel_flush_wire_nonblocking(SpiceChannel *channel,
++                                                 const gchar *ptr,
++                                                 size_t len,
++                                                 GIOCondition *cond)
++{
++    SpiceChannelPrivate *c = channel->priv;
++    gssize ret;
++
++    g_assert(cond != NULL);
++    *cond = 0;
++
++    if (c->tls) {
++        ret = SSL_write(c->ssl, ptr, len);
++        if (ret < 0) {
++            ret = SSL_get_error(c->ssl, ret);
++            if (ret == SSL_ERROR_WANT_READ)
++                *cond |= G_IO_IN;
++            if (ret == SSL_ERROR_WANT_WRITE)
++                *cond |= G_IO_OUT;
++            ret = -1;
++        }
++    } else {
++        GError *error = NULL;
++        ret = g_pollable_output_stream_write_nonblocking(G_POLLABLE_OUTPUT_STREAM(c->out),
++                                                         ptr, len, NULL, &error);
++        if (ret < 0) {
++            if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
++                *cond = G_IO_OUT;
++            } else {
++                CHANNEL_DEBUG(channel, "Send error %s", error->message);
++            }
++            g_clear_error(&error);
++            ret = -1;
++        }
++    }
++
++    return ret;
++}
++
++/*
+  * Write all 'data' of length 'datalen' bytes out to
+  * the wire
+  */
+@@ -754,34 +811,10 @@
+ 
+     while (offset < datalen) {
+         gssize ret;
+-        GError *error = NULL;
+ 
+         if (c->has_error) return;
+ 
+-        cond = 0;
+-        if (c->tls) {
+-            ret = SSL_write(c->ssl, ptr+offset, datalen-offset);
+-            if (ret < 0) {
+-                ret = SSL_get_error(c->ssl, ret);
+-                if (ret == SSL_ERROR_WANT_READ)
+-                    cond |= G_IO_IN;
+-                if (ret == SSL_ERROR_WANT_WRITE)
+-                    cond |= G_IO_OUT;
+-                ret = -1;
+-            }
+-        } else {
+-            ret = g_pollable_output_stream_write_nonblocking(G_POLLABLE_OUTPUT_STREAM(c->out),
+-                                                             ptr+offset, datalen-offset, NULL, &error);
+-            if (ret < 0) {
+-                if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+-                    cond = G_IO_OUT;
+-                } else {
+-                    CHANNEL_DEBUG(channel, "Send error %s", error->message);
+-                }
+-                g_clear_error(&error);
+-                ret = -1;
+-            }
+-        }
++        ret = spice_channel_flush_wire_nonblocking(channel, ptr+offset, datalen-offset, &cond);
+         if (ret == -1) {
+             if (cond != 0) {
+                 // TODO: should use g_pollable_input/output_stream_create_source() in 2.28 ?
+@@ -941,29 +974,32 @@
+ #endif
+ 
+ /*
+- * Read at least 1 more byte of data straight off the wire
+- * into the requested buffer.
++ * Helper function to deal with the nonblocking part of _read_wire() function.
++ * It returns the result of the read and will set the proper bits in @cond in
++ * case the read function would block.
++ *
++ * Returns -1 in case of any problems.
+  */
+ /* coroutine context */
+-static int spice_channel_read_wire(SpiceChannel *channel, void *data, size_t len)
++static int spice_channel_read_wire_nonblocking(SpiceChannel *channel,
++                                               void *data,
++                                               size_t len,
++                                               GIOCondition *cond)
+ {
+     SpiceChannelPrivate *c = channel->priv;
+     gssize ret;
+-    GIOCondition cond;
+-
+-reread:
+ 
+-    if (c->has_error) return 0; /* has_error is set by disconnect(), return no error */
++    g_assert(cond != NULL);
++    *cond = 0;
+ 
+-    cond = 0;
+     if (c->tls) {
+         ret = SSL_read(c->ssl, data, len);
+         if (ret < 0) {
+             ret = SSL_get_error(c->ssl, ret);
+             if (ret == SSL_ERROR_WANT_READ)
+-                cond |= G_IO_IN;
++                *cond |= G_IO_IN;
+             if (ret == SSL_ERROR_WANT_WRITE)
+-                cond |= G_IO_OUT;
++                *cond |= G_IO_OUT;
+             ret = -1;
+         }
+     } else {
+@@ -972,7 +1008,7 @@
+                                                        data, len, NULL, &error);
+         if (ret < 0) {
+             if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
+-                cond = G_IO_IN;
++                *cond = G_IO_IN;
+             } else {
+                 CHANNEL_DEBUG(channel, "Read error %s", error->message);
+             }
+@@ -981,23 +1017,47 @@
+         }
+     }
+ 
+-    if (ret == -1) {
+-        if (cond != 0) {
+-            // TODO: should use g_pollable_input/output_stream_create_source() ?
+-            g_coroutine_socket_wait(&c->coroutine, c->sock, cond);
+-            goto reread;
+-        } else {
++    return ret;
++}
++
++/*
++ * Read at least 1 more byte of data straight off the wire
++ * into the requested buffer.
++ */
++/* coroutine context */
++static int spice_channel_read_wire(SpiceChannel *channel, void *data, size_t len)
++{
++    SpiceChannelPrivate *c = channel->priv;
++
++    while (TRUE) {
++        gssize ret;
++        GIOCondition cond;
++
++        if (c->has_error) {
++            /* has_error is set by disconnect(), return no error */
++            return 0;
++        }
++
++        ret = spice_channel_read_wire_nonblocking(channel, data, len, &cond);
++
++        if (ret == -1) {
++            if (cond != 0) {
++                // TODO: should use g_pollable_input/output_stream_create_source() ?
++                g_coroutine_socket_wait(&c->coroutine, c->sock, cond);
++                continue;
++            } else {
++                c->has_error = TRUE;
++                return errno > 0 ? -errno : -EIO;
++            }
++        }
++        if (ret == 0) {
++            CHANNEL_DEBUG(channel, "Closing the connection: spice_channel_read() - ret=0");
+             c->has_error = TRUE;
+-            return -errno;
++            return 0;
+         }
+-    }
+-    if (ret == 0) {
+-        CHANNEL_DEBUG(channel, "Closing the connection: spice_channel_read() - ret=0");
+-        c->has_error = TRUE;
+-        return 0;
+-    }
+ 
+-    return ret;
++        return ret;
++    }
+ }
+ 
+ #ifdef HAVE_SASL
+@@ -1140,7 +1200,7 @@
+     pubkey = d2i_PUBKEY_bio(bioKey, NULL);
+     g_return_val_if_fail(pubkey != NULL, ret);
+ 
+-    rsa = pubkey->pkey.rsa;
++    rsa = EVP_PKEY_get0_RSA(pubkey);
+     nRSASize = RSA_size(rsa);
+ 
+     encrypted = g_alloca(nRSASize);
+@@ -2327,18 +2387,9 @@
+     return FALSE;
+ }
+ 
+-static X509_LOOKUP_METHOD spice_x509_mem_lookup = {
+-    "spice_x509_mem_lookup",
+-    0
+-};
+-
+ static int spice_channel_load_ca(SpiceChannel *channel)
+ {
+     SpiceChannelPrivate *c = channel->priv;
+-    STACK_OF(X509_INFO) *inf;
+-    X509_INFO *itmp;
+-    X509_LOOKUP *lookup;
+-    BIO *in;
+     int i, count = 0;
+     guint8 *ca;
+     guint size;
+@@ -2347,25 +2398,30 @@
+ 
+     g_return_val_if_fail(c->ctx != NULL, 0);
+ 
+-    lookup = X509_STORE_add_lookup(c->ctx->cert_store, &spice_x509_mem_lookup);
+     ca_file = spice_session_get_ca_file(c->session);
+     spice_session_get_ca(c->session, &ca, &size);
+ 
+     CHANNEL_DEBUG(channel, "Load CA, file: %s, data: %p", ca_file, ca);
+ 
+     if (ca != NULL) {
++        STACK_OF(X509_INFO) *inf;
++        X509_STORE *store;
++        BIO *in;
++
++        store = SSL_CTX_get_cert_store(c->ctx);
+         in = BIO_new_mem_buf(ca, size);
+         inf = PEM_X509_INFO_read_bio(in, NULL, NULL, NULL);
+         BIO_free(in);
+ 
+         for (i = 0; i < sk_X509_INFO_num(inf); i++) {
++            X509_INFO *itmp;
+             itmp = sk_X509_INFO_value(inf, i);
+             if (itmp->x509) {
+-                X509_STORE_add_cert(lookup->store_ctx, itmp->x509);
++                X509_STORE_add_cert(store, itmp->x509);
+                 count++;
+             }
+             if (itmp->crl) {
+-                X509_STORE_add_crl(lookup->store_ctx, itmp->crl);
++                X509_STORE_add_crl(store, itmp->crl);
+                 count++;
+             }
+         }
